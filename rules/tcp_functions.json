@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "description": "TCP函数时延采集规则（用于验证动态探针）",
+  "functions": [
+    {
+      "name": "__tcp_send",
+      "description": "TCP发送",
+      "category": "tcp_data_path",
+      "params": [
+        {"name": "sock", "type": "pointer", "required": true, "description": "socket句柄"},
+        {"name": "buf", "type": "pointer", "required": true, "description": "发送缓冲区"},
+        {"name": "len", "type": "uint32", "required": true, "description": "数据长度"},
+        {"name": "flags", "type": "uint32", "required": false, "description": "标志位"}
+      ]
+    },
+    {
+      "name": "__tcp_recv",
+      "description": "TCP接收",
+      "category": "tcp_data_path",
+      "params": [
+        {"name": "sock", "type": "pointer", "required": true, "description": "socket句柄"},
+        {"name": "buf", "type": "pointer", "required": true, "description": "接收缓冲区"},
+        {"name": "len", "type": "uint32", "required": true, "description": "缓冲区长度"},
+        {"name": "flags", "type": "uint32", "required": false, "description": "标志位"}
+      ]
+    },
+    {
+      "name": "__tcp_connect",
+      "description": "TCP连接",
+      "category": "tcp_control",
+      "params": [
+        {"name": "sock", "type": "pointer", "required": true, "description": "socket句柄"},
+        {"name": "addr", "type": "pointer", "required": true, "description": "地址结构"},
+        {"name": "addrlen", "type": "uint32", "required": true, "description": "地址长度"}
+      ]
+    },
+    {
+      "name": "__tcp_accept",
+      "description": "TCP接受连接",
+      "category": "tcp_control",
+      "params": [
+        {"name": "sock", "type": "pointer", "required": true, "description": "监听socket"},
+        {"name": "addr", "type": "pointer", "required": true, "description": "客户端地址"},
+        {"name": "addrlen", "type": "pointer", "required": true, "description": "地址长度指针"}
+      ]
+    },
+    {
+      "name": "__tcp_close",
+      "description": "TCP关闭",
+      "category": "tcp_control",
+      "params": [
+        {"name": "sock", "type": "pointer", "required": true, "description": "socket句柄"}
+      ]
+    }
+  ]
+}

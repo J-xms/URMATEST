@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "description": "Glibc Socket函数时延采集规则（用于验证动态探针）",
+  "functions": [
+    {
+      "name": "send",
+      "description": "发送数据",
+      "category": "socket",
+      "params": [
+        {"name": "sockfd", "type": "int", "required": true, "description": "socket文件描述符"},
+        {"name": "buf", "type": "pointer", "required": true, "description": "发送缓冲区"},
+        {"name": "len", "type": "size_t", "required": true, "description": "数据长度"},
+        {"name": "flags", "type": "int", "required": false, "description": "标志位"}
+      ]
+    },
+    {
+      "name": "recv",
+      "description": "接收数据",
+      "category": "socket",
+      "params": [
+        {"name": "sockfd", "type": "int", "required": true, "description": "socket文件描述符"},
+        {"name": "buf", "type": "pointer", "required": true, "description": "接收缓冲区"},
+        {"name": "len", "type": "size_t", "required": true, "description": "缓冲区长度"},
+        {"name": "flags", "type": "int", "required": false, "description": "标志位"}
+      ]
+    },
+    {
+      "name": "connect",
+      "description": "建立连接",
+      "category": "socket",
+      "params": [
+        {"name": "sockfd", "type": "int", "required": true, "description": "socket文件描述符"},
+        {"name": "addr", "type": "pointer", "required": true, "description": "地址结构"},
+        {"name": "addrlen", "type": "socklen_t", "required": true, "description": "地址长度"}
+      ]
+    },
+    {
+      "name": "accept",
+      "description": "接受连接",
+      "category": "socket",
+      "params": [
+        {"name": "sockfd", "type": "int", "required": true, "description": "监听socket"},
+        {"name": "addr", "type": "pointer", "required": true, "description": "客户端地址"},
+        {"name": "addrlen", "type": "pointer", "required": true, "description": "地址长度指针"}
+      ]
+    },
+    {
+      "name": "close",
+      "description": "关闭文件描述符",
+      "category": "socket",
+      "params": [
+        {"name": "fd", "type": "int", "required": true, "description": "文件描述符"}
+      ]
+    }
+  ]
+}
