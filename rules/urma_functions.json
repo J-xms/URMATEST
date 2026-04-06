@@ -1,0 +1,74 @@
+{
+  "version": "1.0",
+  "description": "URMA函数时延采集规则",
+  "functions": [
+    {
+      "name": "urma_write",
+      "description": "RDMA远程写操作",
+      "category": "data_path",
+      "params": [
+        {"name": "jfs", "type": "pointer", "required": true, "description": "JFS句柄"},
+        {"name": "target_jfr", "type": "pointer", "required": true, "description": "目标JFR"},
+        {"name": "dst_tseg", "type": "pointer", "required": true, "description": "目标段"},
+        {"name": "src_tseg", "type": "pointer", "required": false, "description": "源段(可为NULL)"},
+        {"name": "dst", "type": "uint64", "required": true, "description": "目标地址"},
+        {"name": "src", "type": "uint64", "required": true, "description": "源地址"},
+        {"name": "len", "type": "uint32", "required": true, "description": "数据长度"},
+        {"name": "flag", "type": "uint32", "required": true, "description": "操作标志"},
+        {"name": "user_ctx", "type": "uint64", "required": true, "description": "用户上下文"}
+      ]
+    },
+    {
+      "name": "urma_read",
+      "description": "RDMA远程读操作",
+      "category": "data_path",
+      "params": [
+        {"name": "jfs", "type": "pointer", "required": true, "description": "JFS句柄"},
+        {"name": "target_jfr", "type": "pointer", "required": true, "description": "目标JFR"},
+        {"name": "dst_tseg", "type": "pointer", "required": true, "description": "目标段"},
+        {"name": "src_tseg", "type": "pointer", "required": true, "description": "源段"},
+        {"name": "dst", "type": "uint64", "required": true, "description": "目标地址"},
+        {"name": "src", "type": "uint64", "required": true, "description": "源地址"},
+        {"name": "len", "type": "uint32", "required": true, "description": "数据长度"},
+        {"name": "flag", "type": "uint32", "required": true, "description": "操作标志"},
+        {"name": "user_ctx", "type": "uint64", "required": true, "description": "用户上下文"}
+      ]
+    },
+    {
+      "name": "urma_send",
+      "description": "发送数据到远程节点",
+      "category": "data_path",
+      "params": [
+        {"name": "jfs", "type": "pointer", "required": true, "description": "JFS句柄"},
+        {"name": "target_jfr", "type": "pointer", "required": true, "description": "目标JFR"},
+        {"name": "src_tseg", "type": "pointer", "required": true, "description": "源段"},
+        {"name": "src", "type": "uint64", "required": true, "description": "源地址"},
+        {"name": "len", "type": "uint32", "required": true, "description": "数据长度"},
+        {"name": "flag", "type": "uint32", "required": true, "description": "操作标志"},
+        {"name": "user_ctx", "type": "uint64", "required": true, "description": "用户上下文"}
+      ]
+    },
+    {
+      "name": "urma_recv",
+      "description": "从远程节点接收数据",
+      "category": "data_path",
+      "params": [
+        {"name": "jfr", "type": "pointer", "required": true, "description": "JFR句柄"},
+        {"name": "recv_tseg", "type": "pointer", "required": true, "description": "接收段"},
+        {"name": "buf", "type": "uint64", "required": true, "description": "接收缓冲区地址"},
+        {"name": "len", "type": "uint32", "required": true, "description": "缓冲区长度"},
+        {"name": "user_ctx", "type": "uint64", "required": true, "description": "用户上下文"}
+      ]
+    },
+    {
+      "name": "urma_poll_jfc",
+      "description": "轮询完成队列",
+      "category": "control_path",
+      "params": [
+        {"name": "jfc", "type": "pointer", "required": true, "description": "JFC句柄"},
+        {"name": "cr_cnt", "type": "int", "required": true, "description": "期望返回的CR数量"},
+        {"name": "cr", "type": "pointer", "required": true, "description": "CR数组指针"}
+      ]
+    }
+  ]
+}
