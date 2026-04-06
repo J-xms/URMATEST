@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-URMA通信链路时延分析工具 - eBPF数据采集器
-基于python3-bpfcc开发，采集URMA关键函数的时延和入参信息
+URMA通信链路时延分析工具 - 动态eBPF采集器
+根据规则文件动态生成探针，采集函数时延和入参值
 """
 
 import argparse
@@ -15,16 +15,52 @@ from datetime import datetime
 from collections import defaultdict
 
 from bcc import BPF
-from bcc.utils import printb
 
-# eBPF程序代码 - USDT探针模式
-URMA_EBPF_PROGRAM = """
-#include <uapi/linux/ptrace.h>
-#include <linux/sched.h>
-#include <linux/fs.h>
 
-// URMA函数时延记录结构
-struct urma_latency_key_t {
+class DynamicProbeGenerator:
+    """根据规则动态生成eBPF探针"""
+    
+    def __init__(self, rules):
+        self.rules = rules
+        self.functions = rules.get('functions', [])
+        self.includes = []
+        self.global_vars = []
+        self.entry_probes = []
+        self.return_probes = []
+        self.structs = []
+        
+        self._generate()
+    
+    def _generate(self):
+        """生成完整的eBPF程序"""
+        self._generate_structs()
+        self._generate_global_vars()
+        self._generate_probes()
+    
+    def _generate_structs(self):
+        """生成数据结构"""
+        # 活跃调用结构 - 存储entry时的上下文
+        self.structs.append("""
+// 活跃函数调用记录
+struct urma_call_ctx_t {
+    char func_name[64];
+    uint64_t enter_time;
+    uint32_t pid;
+    uint32_t tid;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint64_t arg2;
+    uint64_t arg3;
+    uint64_t arg4;
+    uint64_t arg5;
+    uint64_t arg6;
+    uint64_t arg7;
+    uint32_t data_len;
+};""")
+        
+        # 事件结构 - 输出到用户空间
+        self.structs.append("""
+struct urma_event_t {
     char func_name[64];
     uint64_t timestamp;
     uint64_t duration_us;
@@ -36,314 +72,188 @@ struct urma_latency_key_t {
     uint64_t arg3;
     uint64_t arg4;
     uint64_t arg5;
+    uint64_t arg6;
+    uint64_t arg7;
     uint32_t data_len;
     int return_val;
-};
+};""")
+    
+    def _generate_global_vars(self):
+        """生成全局变量"""
+        self.global_vars.append("""
+// 活跃调用存储 (key: pid_tgid -> ctx)
+BPF_HASH(urma_active_calls, uint64_t, struct urma_call_ctx_t);
 
-// 函数调用记录
-struct urma_func_call_t {
-    char func_name[64];
-    uint64_t enter_time;
-    uint32_t pid;
-    uint32_t tid;
-    uint64_t args[6];
-    uint32_t data_len;
-};
-
-// 存储活跃的函数调用
-BPF_HASH(urma_active_calls, uint64_t, struct urma_func_call_t);
-
-// 输出到用户空间的事件
-BPF_PERF_OUTPUT(urma_events);
-
-// urma_write探针
-int trace_urma_write_entry(struct pt_regs *ctx) {
+// 输出事件到用户空间
+BPF_PERF_OUTPUT(urma_events);""")
+    
+    def _generate_probes(self):
+        """为规则中每个函数生成entry和return探针"""
+        for func in self.functions:
+            fname = func['name']
+            params = func.get('params', [])
+            
+            # 获取所有参数（仅收集required的入参）
+            required_params = [p for p in params if p.get('required', False)]
+            
+            # 生成entry probe
+            entry_code = self._generate_entry_probe(fname, required_params)
+            self.entry_probes.append(entry_code)
+            
+            # 生成return probe
+            return_code = self._generate_return_probe(fname, required_params)
+            self.return_probes.append(return_code)
+    
+    def _get_param_accessor(self, param_index, param_type):
+        """获取参数访问表达式"""
+        # PT_REGS_PARM1 ~ PT_REGS_PARM8
+        if param_type == 'pointer':
+            return f"PT_REGS_PARM{param_index + 1}(ctx)"
+        elif param_type == 'uint64':
+            return f"(uint64_t)PT_REGS_PARM{param_index + 1}(ctx)"
+        elif param_type == 'uint32':
+            return f"(uint32_t)PT_REGS_PARM{param_index + 1}(ctx)"
+        elif param_type == 'int':
+            return f"(int)PT_REGS_PARM{param_index + 1}(ctx)"
+        else:
+            return f"PT_REGS_PARM{param_index + 1}(ctx)"
+    
+    def _generate_entry_probe(self, func_name, params):
+        """生成entry探针代码"""
+        # 参数数量
+        num_params = len(params)
+        
+        # 生成参数读取代码
+        arg_reads = []
+        for i, p in enumerate(params):
+            accessor = self._get_param_accessor(i, p.get('type', 'pointer'))
+            arg_reads.append(f"    call->arg{i} = {accessor};")
+        
+        # 特殊处理数据长度参数
+        len_param = None
+        for p in params:
+            if p.get('type') in ('uint32', 'int') and 'len' in p.get('name', '').lower():
+                len_param = p
+                break
+        
+        # 如果没有明确的长度参数，尝试从uint32类型参数中找
+        if len_param is None:
+            for p in params:
+                if p.get('type') == 'uint32':
+                    len_param = p
+                    break
+        
+        len_read = ""
+        if len_param:
+            idx = params.index(len_param)
+            len_read = f"\n    call->data_len = (uint32_t)PT_REGS_PARM{idx + 1}(ctx);"
+        
+        code = f"""
+int trace_{func_name}_entry(struct pt_regs *ctx) {{
     uint64_t pid_tgid = bpf_get_current_pid_tgid();
     uint32_t pid = pid_tgid >> 32;
     uint32_t tid = pid_tgid & 0xFFFFFFFF;
     
-    struct urma_func_call_t call = {};
-    bpf_probe_read_user(&call.func_name, sizeof(call.func_name), "urma_write");
-    call.enter_time = bpf_ktime_get_ns();
-    call.pid = pid;
-    call.tid = tid;
-    call.args[0] = PT_REGS_PARM1(ctx);  // jfs
-    call.args[1] = PT_REGS_PARM2(ctx);  // target_jfr
-    call.args[2] = PT_REGS_PARM3(ctx);  // dst_tseg
-    call.args[3] = PT_REGS_PARM4(ctx);  // dst
-    call.args[4] = PT_REGS_PARM5(ctx);  // src
-    call.args[5] = PT_REGS_PARM6(ctx);  // len
-    
-    // 获取数据长度参数 (第6个参数)
-    uint32_t len = (uint32_t)PT_REGS_PARM6(ctx);
-    call.data_len = len;
-    
-    uint64_t key = pid_tgid;
-    urma_active_calls.update(&key, &call);
-    return 0;
-}
-
-int trace_urma_write_return(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    uint64_t key = pid_tgid;
-    struct urma_func_call_t *call = urma_active_calls.lookup(&key);
-    if (call == NULL) {
+    struct urma_call_ctx_t *call = bpf_ringbuf_reserve(&urma_events, sizeof(struct urma_call_ctx_t), 0);
+    if (!call) {{
         return 0;
-    }
+    }}
     
-    uint64_t now = bpf_ktime_get_ns();
-    uint64_t duration_ns = now - call->enter_time;
-    
-    struct urma_latency_key_t event = {};
-    bpf_probe_read_user_str(&event.func_name, sizeof(event.func_name), call->func_name);
-    event.timestamp = now;
-    event.duration_us = duration_ns / 1000;
-    event.pid = pid;
-    event.tid = tid;
-    event.arg0 = call->args[0];
-    event.arg1 = call->args[1];
-    event.arg2 = call->args[2];
-    event.arg3 = call->args[3];
-    event.arg4 = call->args[4];
-    event.arg5 = call->args[5];
-    event.data_len = call->data_len;
-    event.return_val = (int)PT_REGS_RC(ctx);
-    
-    urma_events.perf_submit(ctx, &event, sizeof(event));
-    urma_active_calls.delete(&key);
-    return 0;
-}
-
-// urma_read探针
-int trace_urma_read_entry(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    struct urma_func_call_t call = {};
-    bpf_probe_read_user(&call.func_name, sizeof(call.func_name), "urma_read");
-    call.enter_time = bpf_ktime_get_ns();
-    call.pid = pid;
-    call.tid = tid;
-    call.args[0] = PT_REGS_PARM1(ctx);
-    call.args[1] = PT_REGS_PARM2(ctx);
-    call.args[2] = PT_REGS_PARM3(ctx);
-    call.args[3] = PT_REGS_PARM4(ctx);
-    call.args[4] = PT_REGS_PARM5(ctx);
-    call.args[5] = PT_REGS_PARM6(ctx);
-    
-    uint32_t len = (uint32_t)PT_REGS_PARM6(ctx);
-    call.data_len = len;
-    
-    uint64_t key = pid_tgid;
-    urma_active_calls.update(&key, &call);
-    return 0;
-}
-
-int trace_urma_read_return(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    uint64_t key = pid_tgid;
-    struct urma_func_call_t *call = urma_active_calls.lookup(&key);
-    if (call == NULL) {
-        return 0;
-    }
-    
-    uint64_t now = bpf_ktime_get_ns();
-    uint64_t duration_ns = now - call->enter_time;
-    
-    struct urma_latency_key_t event = {};
-    bpf_probe_read_user_str(&event.func_name, sizeof(event.func_name), call->func_name);
-    event.timestamp = now;
-    event.duration_us = duration_ns / 1000;
-    event.pid = pid;
-    event.tid = tid;
-    event.arg0 = call->args[0];
-    event.arg1 = call->args[1];
-    event.arg2 = call->args[2];
-    event.arg3 = call->args[3];
-    event.arg4 = call->args[4];
-    event.arg5 = call->args[5];
-    event.data_len = call->data_len;
-    event.return_val = (int)PT_REGS_RC(ctx);
-    
-    urma_events.perf_submit(ctx, &event, sizeof(event));
-    urma_active_calls.delete(&key);
-    return 0;
-}
-
-// urma_send探针
-int trace_urma_send_entry(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    struct urma_func_call_t call = {};
-    bpf_probe_read_user(&call.func_name, sizeof(call.func_name), "urma_send");
-    call.enter_time = bpf_ktime_get_ns();
-    call.pid = pid;
-    call.tid = tid;
-    call.args[0] = PT_REGS_PARM1(ctx);
-    call.args[1] = PT_REGS_PARM2(ctx);
-    call.args[2] = PT_REGS_PARM3(ctx);
-    call.args[3] = PT_REGS_PARM4(ctx);
-    call.args[4] = PT_REGS_PARM5(ctx);
-    
-    uint32_t len = (uint32_t)PT_REGS_PARM5(ctx);
-    call.data_len = len;
-    
-    uint64_t key = pid_tgid;
-    urma_active_calls.update(&key, &call);
-    return 0;
-}
-
-int trace_urma_send_return(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    uint64_t key = pid_tgid;
-    struct urma_func_call_t *call = urma_active_calls.lookup(&key);
-    if (call == NULL) {
-        return 0;
-    }
-    
-    uint64_t now = bpf_ktime_get_ns();
-    uint64_t duration_ns = now - call->enter_time;
-    
-    struct urma_latency_key_t event = {};
-    bpf_probe_read_user_str(&event.func_name, sizeof(event.func_name), call->func_name);
-    event.timestamp = now;
-    event.duration_us = duration_ns / 1000;
-    event.pid = pid;
-    event.tid = tid;
-    event.arg0 = call->args[0];
-    event.arg1 = call->args[1];
-    event.arg2 = call->args[2];
-    event.arg3 = call->args[3];
-    event.arg4 = call->args[4];
-    event.arg5 = call->args[5];
-    event.data_len = call->data_len;
-    event.return_val = (int)PT_REGS_RC(ctx);
-    
-    urma_events.perf_submit(ctx, &event, sizeof(event));
-    urma_active_calls.delete(&key);
-    return 0;
-}
-
-// urma_recv探针
-int trace_urma_recv_entry(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    struct urma_func_call_t call = {};
-    bpf_probe_read_user(&call.func_name, sizeof(call.func_name), "urma_recv");
-    call.enter_time = bpf_ktime_get_ns();
-    call.pid = pid;
-    call.tid = tid;
-    call.args[0] = PT_REGS_PARM1(ctx);
-    call.args[1] = PT_REGS_PARM2(ctx);
-    call.args[2] = PT_REGS_PARM3(ctx);
-    call.args[3] = PT_REGS_PARM4(ctx);
-    
-    uint32_t len = (uint32_t)PT_REGS_PARM4(ctx);
-    call.data_len = len;
-    
-    uint64_t key = pid_tgid;
-    urma_active_calls.update(&key, &call);
-    return 0;
-}
-
-int trace_urma_recv_return(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    uint64_t key = pid_tgid;
-    struct urma_func_call_t *call = urma_active_calls.lookup(&key);
-    if (call == NULL) {
-        return 0;
-    }
-    
-    uint64_t now = bpf_ktime_get_ns();
-    uint64_t duration_ns = now - call->enter_time;
-    
-    struct urma_latency_key_t event = {};
-    bpf_probe_read_user_str(&event.func_name, sizeof(event.func_name), call->func_name);
-    event.timestamp = now;
-    event.duration_us = duration_ns / 1000;
-    event.pid = pid;
-    event.tid = tid;
-    event.arg0 = call->args[0];
-    event.arg1 = call->args[1];
-    event.arg2 = call->args[2];
-    event.arg3 = call->args[3];
-    event.arg4 = call->args[4];
-    event.arg5 = call->args[5];
-    event.data_len = call->data_len;
-    event.return_val = (int)PT_REGS_RC(ctx);
-    
-    urma_events.perf_submit(ctx, &event, sizeof(event));
-    urma_active_calls.delete(&key);
-    return 0;
-}
-
-// urma_poll_jfc探针
-int trace_urma_poll_jfc_entry(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    struct urma_func_call_t call = {};
-    bpf_probe_read_user(&call.func_name, sizeof(call.func_name), "urma_poll_jfc");
-    call.enter_time = bpf_ktime_get_ns();
-    call.pid = pid;
-    call.tid = tid;
-    call.args[0] = PT_REGS_PARM1(ctx);
-    call.args[1] = PT_REGS_PARM2(ctx);
-    call.args[2] = PT_REGS_PARM3(ctx);
-    
-    uint64_t key = pid_tgid;
-    urma_active_calls.update(&key, &call);
-    return 0;
-}
-
-int trace_urma_poll_jfc_return(struct pt_regs *ctx) {
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    uint32_t pid = pid_tgid >> 32;
-    uint32_t tid = pid_tgid & 0xFFFFFFFF;
-    
-    uint64_t key = pid_tgid;
-    struct urma_func_call_t *call = urma_active_calls.lookup(&key);
-    if (call == NULL) {
-        return 0;
-    }
-    
-    uint64_t now = bpf_ktime_get_ns();
-    uint64_t duration_ns = now - call->enter_time;
-    
-    struct urma_latency_key_t event = {};
-    bpf_probe_read_user_str(&event.func_name, sizeof(event.func_name), call->func_name);
-    event.timestamp = now;
-    event.duration_us = duration_ns / 1000;
-    event.pid = pid;
-    event.tid = tid;
-    event.arg0 = call->args[0];
-    event.arg1 = call->args[1];
-    event.arg2 = call->args[2];
-    event.return_val = (int)PT_REGS_RC(ctx);
-    
-    urma_events.perf_submit(ctx, &event, sizeof(event));
-    urma_active_calls.delete(&key);
-    return 0;
-}
+    bpf_probe_read(&call->func_name, sizeof(call->func_name), "{func_name}");
+    call->enter_time = bpf_ktime_get_ns();
+    call->pid = pid;
+    call->tid = tid;
 """
+        
+        for i, p in enumerate(params):
+            if i < 8:  # 最多8个参数
+                accessor = self._get_param_accessor(i, p.get('type', 'pointer'))
+                code += f"    call->arg{i} = {accessor};\n"
+        
+        if len_read:
+            code += len_read
+        
+        code += """
+    
+    uint64_t key = pid_tgid;
+    urma_active_calls.update(&key, call);
+    bpf_ringbuf_submit(call, 0);
+    return 0;
+}}"""
+        
+        return code
+    
+    def _generate_return_probe(self, func_name, params):
+        """生成return探针代码"""
+        code = f"""
+int trace_{func_name}_return(struct pt_regs *ctx) {{
+    uint64_t pid_tgid = bpf_get_current_pid_tgid();
+    uint32_t pid = pid_tgid >> 32;
+    uint32_t tid = pid_tgid & 0xFFFFFFFF;
+    
+    uint64_t key = pid_tgid;
+    struct urma_call_ctx_t *call = urma_active_calls.lookup(&key);
+    if (call == NULL) {{
+        return 0;
+    }}
+    
+    uint64_t now = bpf_ktime_get_ns();
+    uint64_t duration_ns = now - call->enter_time;
+    
+    struct urma_event_t *event = bpf_ringbuf_reserve(&urma_events, sizeof(struct urma_event_t), 0);
+    if (!event) {{
+        urma_active_calls.delete(&key);
+        return 0;
+    }}
+    
+    bpf_probe_read(&event->func_name, sizeof(event->func_name), call->func_name);
+    event->timestamp = now;
+    event->duration_us = duration_ns / 1000;
+    event->pid = pid;
+    event->tid = tid;
+    event->arg0 = call->arg0;
+    event->arg1 = call->arg1;
+    event->arg2 = call->arg2;
+    event->arg3 = call->arg3;
+    event->arg4 = call->arg4;
+    event->arg5 = call->arg5;
+    event->arg6 = call->arg6;
+    event->arg7 = call->arg7;
+    event->data_len = call->data_len;
+    event->return_val = (int)PT_REGS_RC(ctx);
+    
+    bpf_ringbuf_submit(event, 0);
+    urma_active_calls.delete(&key);
+    return 0;
+}}"""
+        
+        return code
+    
+    def build_bpf_program(self):
+        """构建完整的BPF程序"""
+        program = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+"""
+        
+        # 添加结构体定义
+        for s in self.structs:
+            program += s
+        
+        # 添加全局变量
+        for g in self.global_vars:
+            program += g
+        
+        # 添加entry探针
+        for e in self.entry_probes:
+            program += e
+        
+        # 添加return探针
+        for r in self.return_probes:
+            program += r
+        
+        return program
 
 
 class URMALatencyCollector:
@@ -363,21 +273,17 @@ class URMALatencyCollector:
             'count': 0,
             'total_us': 0,
             'min_us': float('inf'),
-            'max_us': 0
+            'max_us': 0,
+            'params': {}  # 入参统计
         })
         
-        # 确保输出目录存在
         os.makedirs(output_dir, exist_ok=True)
-        
-        # 加载规则
         self._load_rules()
         
-        # 注册信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """处理退出信号"""
         print("\n\n接收到退出信号，正在停止采集...")
         self.running = False
     
@@ -387,7 +293,10 @@ class URMALatencyCollector:
             with open(self.rules_file, 'r') as f:
                 self.rules = json.load(f)
             print(f"成功加载规则文件: {self.rules_file}")
-            print(f"包含 {len(self.rules.get('functions', []))} 个函数")
+            print(f"包含 {len(self.rules.get('functions', []))} 个函数:")
+            for func in self.rules.get('functions', []):
+                params = [p['name'] for p in func.get('params', []) if p.get('required')]
+                print(f"  - {func['name']}: {', '.join(params) if params else '无必选参数'}")
         except Exception as e:
             print(f"加载规则文件失败: {e}")
             sys.exit(1)
@@ -395,56 +304,60 @@ class URMALatencyCollector:
     def _init_bpf(self):
         """初始化BPF程序"""
         try:
-            self.bpf = BPF(text=URMA_EBPF_PROGRAM)
+            # 动态生成探针
+            generator = DynamicProbeGenerator(self.rules)
+            bpf_program = generator.build_bpf_program()
             
-            # 附加探针到URMA函数
-            functions = [
-                ('urma_write', 'trace_urma_write_entry', 'trace_urma_write_return'),
-                ('urma_read', 'trace_urma_read_entry', 'trace_urma_read_return'),
-                ('urma_send', 'trace_urma_send_entry', 'trace_urma_send_return'),
-                ('urma_recv', 'trace_urma_recv_entry', 'trace_urma_recv_return'),
-                ('urma_poll_jfc', 'trace_urma_poll_jfc_entry', 'trace_urma_poll_jfc_return'),
-            ]
+            # 调试用：打印生成的程序（注释掉以减少输出）
+            # print("=== 生成的eBPF程序 ===")
+            # print(bpf_program)
+            # print("=" * 50)
             
-            for func_name, entry_name, return_name in functions:
+            self.bpf = BPF(text=bpf_program)
+            
+            # 附加探针
+            lib_path = self._find_urma_library()
+            print(f"\nURMA库路径: {lib_path}")
+            
+            for func in self.rules.get('functions', []):
+                fname = func['name']
                 try:
                     self.bpf.attach_uprobe(
-                        name=self._find_urma_library(),
-                        sym=func_name,
-                        fn_name=entry_name
+                        name=lib_path,
+                        sym=fname,
+                        fn_name=f"trace_{fname}_entry"
                     )
                     self.bpf.attach_uretprobe(
-                        name=self._find_urma_library(),
-                        sym=func_name,
-                        fn_name=return_name
+                        name=lib_path,
+                        sym=fname,
+                        fn_name=f"trace_{fname}_return"
                     )
-                    print(f"已附加探针: {func_name}")
+                    print(f"✓ 已附加探针: {fname}")
                 except Exception as e:
-                    print(f"附加探针 {func_name} 失败: {e}")
+                    print(f"✗ 附加探针 {fname} 失败: {e}")
             
-            # 设置事件回调
-            self.bpf["urma_events"].open_perf_buffer(self._process_event)
+            # 设置事件回调 - 使用ringbuf
+            self.bpf["urma_events"].open_perf_buffer(self._process_event, page_cnt=256)
             
         except Exception as e:
             print(f"初始化BPF失败: {e}")
-            print("提示: 确保已安装bpfcc-tools并具有root权限")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     
     def _find_urma_library(self):
         """查找URMA库路径"""
-        # 常见的URMA库路径
         possible_paths = [
             '/usr/lib/x86_64-linux-gnu/liburma.so',
             '/usr/lib64/liburma.so',
             '/usr/local/lib/liburma.so',
-            'liburma.so',  # 让bcc在系统库路径中搜索
+            'liburma.so',
         ]
         
         for path in possible_paths:
             if os.path.exists(path) if not path.startswith('lib') else True:
                 return path
         
-        # 返回默认库名，让系统搜索
         return 'liburma.so'
     
     def _process_event(self, cpu, data, size):
@@ -454,13 +367,25 @@ class URMALatencyCollector:
             
             func_name = event.func_name.decode('utf-8', errors='replace').strip('\x00')
             
+            # 获取入参值
+            args = {
+                'arg0': event.arg0,
+                'arg1': event.arg1,
+                'arg2': event.arg2,
+                'arg3': event.arg3,
+                'arg4': event.arg4,
+                'arg5': event.arg5,
+                'arg6': event.arg6,
+                'arg7': event.arg7,
+            }
+            
             record = {
                 'timestamp': event.timestamp,
                 'func_name': func_name,
                 'duration_us': event.duration_us,
                 'pid': event.pid,
                 'tid': event.tid,
-                'args': [event.arg0, event.arg1, event.arg2, event.arg3, event.arg4, event.arg5],
+                'args': args,
                 'data_len': event.data_len,
                 'return_val': event.return_val
             }
@@ -474,8 +399,33 @@ class URMALatencyCollector:
             stats['min_us'] = min(stats['min_us'], event.duration_us)
             stats['max_us'] = max(stats['max_us'], event.duration_us)
             
+            # 入参统计（按长度分布）
+            if event.data_len > 0:
+                bucket = self._get_size_bucket(event.data_len)
+                if bucket not in stats['params']:
+                    stats['params'][bucket] = {'count': 0, 'total_us': 0}
+                stats['params'][bucket]['count'] += 1
+                stats['params'][bucket]['total_us'] += event.duration_us
+            
         except Exception as e:
-            print(f"处理事件失败: {e}")
+            print(f"\n处理事件失败: {e}")
+    
+    def _get_size_bucket(self, size):
+        """获取数据大小桶"""
+        if size < 64:
+            return "<64B"
+        elif size < 256:
+            return "64-256B"
+        elif size < 1024:
+            return "256B-1KB"
+        elif size < 4096:
+            return "1-4KB"
+        elif size < 16384:
+            return "4-16KB"
+        elif size < 65536:
+            return "16-64KB"
+        else:
+            return ">64KB"
     
     def _print_stats(self):
         """打印统计信息"""
@@ -492,6 +442,17 @@ class URMALatencyCollector:
                 print(f"{func_name:<20} {stats['count']:>10} {avg_us:>15.2f} {min_us:>12} {stats['max_us']:>12}")
         
         print("="*80)
+        
+        # 入参分布
+        print("\n按数据长度分布:")
+        print("-"*60)
+        for func_name, stats in sorted(self.stats.items()):
+            if stats['count'] > 0 and stats['params']:
+                print(f"\n  {func_name}:")
+                for bucket in sorted(stats['params'].keys()):
+                    p = stats['params'][bucket]
+                    avg = p['total_us'] / p['count'] if p['count'] > 0 else 0
+                    print(f"    {bucket:>10}: {p['count']:>6}次, 平均{avg:>8.2f}us")
     
     def _save_results(self):
         """保存采集结果"""
@@ -501,6 +462,7 @@ class URMALatencyCollector:
         raw_file = os.path.join(self.output_dir, f'urma_latency_{timestamp}.json')
         with open(raw_file, 'w') as f:
             json.dump({
+                'rules_version': self.rules.get('version', 'unknown'),
                 'start_time': self.events[0]['timestamp'] if self.events else 0,
                 'end_time': self.events[-1]['timestamp'] if self.events else 0,
                 'total_events': len(self.events),
@@ -522,7 +484,8 @@ class URMALatencyCollector:
                     'count': stats['count'],
                     'avg_latency_us': stats['total_us'] / stats['count'],
                     'min_latency_us': stats['min_us'] if stats['min_us'] != float('inf') else 0,
-                    'max_latency_us': stats['max_us']
+                    'max_latency_us': stats['max_us'],
+                    'size_distribution': stats['params']
                 }
         
         with open(stats_file, 'w') as f:
@@ -533,7 +496,6 @@ class URMALatencyCollector:
         stack_file = os.path.join(self.output_dir, f'urma_stacks_{timestamp}.txt')
         with open(stack_file, 'w') as f:
             for event in self.events:
-                # 格式: func_name pid tid duration_us
                 f.write(f"{event['func_name']} {event['pid']} {event['tid']} {event['duration_us']}\n")
         print(f"栈数据已保存: {stack_file}")
         
@@ -542,12 +504,11 @@ class URMALatencyCollector:
     def collect(self):
         """执行采集"""
         print("="*80)
-        print("URMA通信链路时延分析 - eBPF采集器")
+        print("URMA通信链路时延分析 - 动态eBPF采集器")
         print("="*80)
         print(f"规则文件: {self.rules_file}")
         print(f"输出目录: {self.output_dir}")
         print(f"采集时长: {self.duration}秒")
-        print(f"等待URMA库加载并开始采集... (按Ctrl+C停止)")
         print("-"*80)
         
         # 初始化BPF
@@ -556,26 +517,19 @@ class URMALatencyCollector:
         start_time = time.time()
         last_print = start_time
         
+        print("\n开始采集... (按Ctrl+C停止)")
+        print("-"*80)
+        
         try:
             while self.running and (time.time() - start_time) < self.duration:
                 self.bpf.perf_buffer_poll(timeout=100)
                 
-                # 每秒打印一次进度
                 current_time = time.time()
-                if current_time - last_print >= 1.0:
+                if current_time - last_print >= 2.0:
                     elapsed = int(current_time - start_time)
                     total_events = len(self.events)
                     print(f"\r采集进度: {elapsed}/{self.duration}秒 | 事件数: {total_events}", end='', flush=True)
                     last_print = current_time
-                    
-                    # 打印当前统计
-                    if total_events > 0:
-                        print("\n当前统计:")
-                        for func_name, stats in sorted(self.stats.items())[:5]:
-                            if stats['count'] > 0:
-                                avg_us = stats['total_us'] / stats['count']
-                                print(f"  {func_name}: {stats['count']}次, 平均{avg_us:.2f}us")
-                        print("-" * 60, end='')
         
         except Exception as e:
             print(f"\n采集过程出错: {e}")
@@ -593,30 +547,30 @@ class URMALatencyCollector:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='URMA通信链路时延分析工具 - eBPF采集器',
+        description='URMA通信链路时延分析 - 动态eBPF采集器',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+根据urma_functions.json规则动态生成eBPF探针，采集函数时延和入参值。
+
 示例:
-  sudo %(prog)s -r rules/urma_functions.json -o output -d 60
-  sudo %(prog)s --rules rules/urma_functions.json --output output --duration 30
+  sudo python3 urma_latency_collector.py -r rules/urma_functions.json -o output -d 60
 
 注意:
-  此工具需要root权限运行，因为eBPF探针需要特权访问。
+  此工具需要root权限运行。
         """
     )
     
     parser.add_argument('-r', '--rules', 
                        default='/root/URMATEST/rules/urma_functions.json',
-                       help='函数规则JSON文件路径 (默认: /root/URMATEST/rules/urma_functions.json)')
+                       help='函数规则JSON文件路径')
     parser.add_argument('-o', '--output', 
                        default='/root/URMATEST/output',
-                       help='输出目录路径 (默认: /root/URMATEST/output)')
+                       help='输出目录路径')
     parser.add_argument('-d', '--duration', type=int, default=60,
-                       help='采集时长(秒) (默认: 60)')
+                       help='采集时长(秒)')
     
     args = parser.parse_args()
     
-    # 检查权限
     if os.geteuid() != 0:
         print("错误: 此工具需要root权限运行")
         print("请使用: sudo python3", ' '.join(sys.argv))
